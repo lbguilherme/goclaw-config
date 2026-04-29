@@ -431,9 +431,200 @@ export function stripDefaults(
   return result;
 }
 
+// ─────────────────────────── Provider ───────────────────────────
+
+export const PROVIDER_DEFAULTS = {
+  enabled: true,
+  settings: {} as Record<string, unknown>,
+} as const;
+
+/**
+ * Provider implementation kinds accepted by the GoClaw backend
+ * (providers.go:159-249). Each has its own auth/api_base requirements,
+ * documented in the schema description.
+ */
+const PROVIDER_TYPES = [
+  "anthropic_native",
+  "openai",
+  "openrouter",
+  "gemini_native",
+  "ollama",
+  "ollama_cloud",
+  "claude_cli",
+  "acp",
+  "chatgpt_oauth",
+  "dashscope",
+  "bailian",
+  "novita",
+  "minimax_native",
+] as const;
+
+export type ProviderType = (typeof PROVIDER_TYPES)[number];
+
+/**
+ * Server-side `api_base` defaults applied by the GoClaw backend when the
+ * provider is created without one (providers.go:159-249). Mirrored here so
+ * pull can strip the field when it matches and yaml stays clean — push then
+ * refills it before diffing. Provider types not listed have no default and
+ * require the user to set api_base explicitly.
+ */
+export const PROVIDER_API_BASE_DEFAULTS: Partial<Record<ProviderType, string>> = {
+  ollama: "http://localhost:11434/v1",
+  gemini_native: "https://generativelanguage.googleapis.com/v1beta/openai",
+  bailian: "https://coding-intl.dashscope.aliyuncs.com/v1",
+  novita: "https://api.novita.ai/openai",
+  claude_cli: "claude",
+};
+
+export function providerApiBaseDefault(providerType: string): string | undefined {
+  return PROVIDER_API_BASE_DEFAULTS[providerType as ProviderType];
+}
+
+const ReasoningEffortEnum = z.enum([
+  "off",
+  "auto",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
+
+const ReasoningFallbackEnum = z.enum(["downgrade", "off", "provider_default"]);
+
+const CodexPoolStrategyEnum = z.enum([
+  "manual",
+  "primary_first",
+  "round_robin",
+  "priority_order",
+]);
+
+const ProviderEmbeddingSchema = z
+  .strictObject({
+    enabled: z
+      .boolean()
+      .optional()
+      .describe("When true, this provider can serve embedding requests."),
+    model: z
+      .string()
+      .optional()
+      .describe("Embedding model identifier (e.g. text-embedding-3-small)."),
+    api_base: z
+      .string()
+      .optional()
+      .describe("Optional override when the embedding endpoint differs from chat's api_base."),
+    dimensions: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Embedding output dimensions. Backend validation: when enabled=true, must be 0 " +
+          "(use model default) or exactly 1536. Provider types `anthropic_native` and `acp` " +
+          "cannot serve embeddings.",
+      ),
+  })
+  .describe("Embedding endpoint configuration for this provider.");
+
+const ProviderReasoningDefaultsSchema = z
+  .strictObject({
+    effort: ReasoningEffortEnum.optional(),
+    fallback: ReasoningFallbackEnum.optional(),
+  })
+  .describe(
+    "Provider-level reasoning defaults inherited by agents whose `reasoning_config.override_mode` " +
+      "is `inherit`.",
+  );
+
+const ProviderCodexPoolSchema = z
+  .strictObject({
+    strategy: CodexPoolStrategyEnum.optional(),
+    extra_provider_names: z.array(z.string()).optional(),
+  })
+  .describe(
+    "ChatGPT-OAuth multi-account pool defaults. Only meaningful when provider_type=chatgpt_oauth.",
+  );
+
+const ProviderSettingsSchema = z
+  .strictObject({
+    embedding: ProviderEmbeddingSchema.optional(),
+    reasoning_defaults: ProviderReasoningDefaultsSchema.optional(),
+    codex_pool: ProviderCodexPoolSchema.optional(),
+  })
+  .describe(
+    "Structured JSONB bag for provider-level settings. The backend reads these specific keys; " +
+      "unknown keys are tolerated but ignored.",
+  );
+
+/**
+ * Sentinel value written in place of a real API key during pull. On push, fields
+ * with this exact value are stripped from the update payload so the server-side
+ * secret is never overwritten. To rotate a key, replace the sentinel with the
+ * actual value in the YAML before pushing.
+ */
+export const PROVIDER_API_KEY_SENTINEL = "[encrypted]";
+
+export const ProviderSchema = z
+  .strictObject({
+    display_name: z
+      .string()
+      .optional()
+      .describe("Human-readable name shown in UI (distinct from the slug-style `name` filename)."),
+    provider_type: z
+      .enum(PROVIDER_TYPES)
+      .describe(
+        "Provider implementation kind. Auth/api_base requirements vary per type:\n" +
+          "  • anthropic_native — api_key required; api_base = Anthropic URL.\n" +
+          "  • openai / openrouter / gemini_native / dashscope / bailian / novita / minimax_native — " +
+          "api_key required; api_base = provider URL (OpenAI-compatible).\n" +
+          "  • ollama — no api_key; api_base = server URL (default http://localhost:11434/v1). " +
+          "Localhost is rewritten to host.docker.internal when the gateway runs in a container.\n" +
+          "  • ollama_cloud — api_key required; api_base = URL with /v1.\n" +
+          "  • claude_cli — no api_key; api_base = path to the binary (default `claude`). " +
+          "Relative paths only accepted when literally `claude`; others must be absolute. " +
+          "Singleton per instance.\n" +
+          "  • acp — no api_key; api_base = binary name (claude / codex / gemini / abs path). " +
+          "Verify-only; runtime managed externally.\n" +
+          "  • chatgpt_oauth — auth via OAuth (no api_key); tokens loaded from oauth.NewDBTokenSource.",
+      ),
+    api_base: z
+      .string()
+      .optional()
+      .describe(
+        "Base URL of the provider's API, or path/binary name for claude_cli / acp. " +
+          "See `provider_type` for per-type semantics.",
+      ),
+    api_key: z
+      .string()
+      .optional()
+      .describe(
+        "API key for the provider. Pulled values are replaced with the sentinel " +
+          `"${PROVIDER_API_KEY_SENTINEL}" — push leaves the existing key untouched when it ` +
+          "sees that sentinel. To rotate, replace the sentinel with the real key. " +
+          "Required by anthropic_native, openai, openrouter, gemini_native, ollama_cloud, " +
+          "dashscope, bailian, novita, minimax_native; ignored by ollama, claude_cli, acp, chatgpt_oauth.",
+      ),
+    enabled: z
+      .boolean()
+      .default(PROVIDER_DEFAULTS.enabled)
+      .describe("When false, the provider is configured but cannot be used by agents."),
+    settings: ProviderSettingsSchema.default(PROVIDER_DEFAULTS.settings).describe(
+      "Provider-level knobs read by the backend (embedding, reasoning_defaults, codex_pool). " +
+        "Stored as JSONB; only the keys defined in the schema are interpreted.",
+    ),
+  })
+  .describe(
+    "Configuration file written to <tenant>/providers/<name>.yaml. The filename is the provider " +
+      "slug (= remote `name` field), used as the value for agent.yaml's `provider` field.",
+  );
+
+export type ProviderConfig = z.infer<typeof ProviderSchema>;
+
 export const SCHEMA_REGISTRY = {
   tenant: { schema: TenantSchema, fileName: "tenant.schema.json" },
   agent: { schema: AgentSchema, fileName: "agent.schema.json" },
+  provider: { schema: ProviderSchema, fileName: "provider.schema.json" },
 } as const;
 
 export type SchemaName = keyof typeof SCHEMA_REGISTRY;

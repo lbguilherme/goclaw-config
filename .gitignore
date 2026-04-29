@@ -4,5 +4,5 @@ node_modules/
 bun.lockb
 *.log
 .DS_Store
-tenants
+goclaw
 schemas

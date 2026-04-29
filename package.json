@@ -10,6 +10,7 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "pull": "bun run src/index.ts pull",
+    "push": "bun run src/index.ts push",
     "typecheck": "bun tsc --noEmit"
   },
   "dependencies": {

@@ -3,15 +3,19 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { ZodType } from "zod";
 
-import { GoClawClient, type Agent, type Tenant } from "../client.ts";
+import { GoClawClient, type Agent, type Provider, type Tenant } from "../client.ts";
 import { loadConfig } from "../config.ts";
 import {
   AGENT_DEFAULTS,
   AgentSchema,
   CANONICAL_CONTEXT_FILES,
+  PROVIDER_API_KEY_SENTINEL,
+  PROVIDER_DEFAULTS,
+  ProviderSchema,
   TENANT_DEFAULTS,
   TenantSchema,
   agentWorkspaceDefault,
+  providerApiBaseDefault,
   stripDefaults,
 } from "../schemas.ts";
 import { writeJsonSchemas, type SchemaPaths } from "../schema-output.ts";
@@ -35,8 +39,11 @@ export async function pull(): Promise<void> {
     return;
   }
 
+  const tenantsDir = join(config.outputDir, "tenants");
+  await mkdir(tenantsDir, { recursive: true });
+
   for (const tenant of tenants) {
-    await pullTenant(client, config, tenant, config.outputDir, schemaPaths);
+    await pullTenant(client, config, tenant, tenantsDir, schemaPaths);
   }
 
   console.log("\n✓ Pull complete.");
@@ -65,8 +72,13 @@ async function pullTenant(
     `tenant ${tenant.name ?? tenant.id}`,
   );
 
+  await pullProviders(client, tenant, tenantPath, schemaPaths);
+
   const agents = await client.listAgents(tenant.id);
   if (agents.length === 0) return;
+
+  const agentsPath = join(tenantPath, "agents");
+  await mkdir(agentsPath, { recursive: true });
 
   // Context files come over a tenant-scoped WebSocket connection.
   const ws = new GoClawWSClient(config);
@@ -74,11 +86,86 @@ async function pullTenant(
     const tenantSlugForWS = typeof tenant.slug === "string" ? tenant.slug : String(tenant.id);
     await ws.connect(tenantSlugForWS);
     for (const agent of agents) {
-      await pullAgent(client, ws, tenant, agent, tenantPath, schemaPaths);
+      await pullAgent(client, ws, tenant, agent, agentsPath, schemaPaths);
     }
   } finally {
     ws.close();
   }
+}
+
+const PROVIDER_OMIT_FIELDS = ["id", "created_at", "updated_at", "tenant_id", "name"] as const;
+
+/**
+ * Pulls the provider list for a tenant and writes one YAML per provider under
+ * <tenant>/providers/<name>.yaml. The `api_key` server-side is masked, so we
+ * write the sentinel "[encrypted]" — but if the existing file already has a
+ * real key (a value that isn't the sentinel), we preserve it on disk so a
+ * subsequent push can rotate the key.
+ */
+async function pullProviders(
+  client: GoClawClient,
+  tenant: Tenant,
+  tenantPath: string,
+  schemaPaths: SchemaPaths,
+): Promise<void> {
+  const providers = await client.listProviders(tenant.id);
+  if (providers.length === 0) return;
+
+  const providersPath = join(tenantPath, "providers");
+  await mkdir(providersPath, { recursive: true });
+
+  for (const provider of providers) {
+    const slug = safeFolderName(provider.name, provider.id);
+    const filePath = join(providersPath, `${slug}.yaml`);
+    console.log(`  [provider] ${provider.name ?? provider.id} → ${filePath}`);
+
+    const data = stripProviderFields(provider);
+    if ("api_key" in data) {
+      const existing = await readExistingApiKey(filePath);
+      data.api_key = existing ?? PROVIDER_API_KEY_SENTINEL;
+    }
+    // Strip api_base when it matches the per-type default — keeps yaml clean
+    // for the common case. Push refills it before diffing.
+    const typeDefault = providerApiBaseDefault(String(data.provider_type ?? ""));
+    if (typeDefault !== undefined && data.api_base === typeDefault) {
+      delete data.api_base;
+    }
+
+    await writeYaml(
+      filePath,
+      data,
+      ProviderSchema,
+      PROVIDER_DEFAULTS,
+      schemaPaths.urls.provider,
+      `provider ${provider.name ?? provider.id}`,
+    );
+  }
+}
+
+function stripProviderFields(provider: Provider): Record<string, unknown> {
+  const rest: Record<string, unknown> = { ...provider };
+  for (const field of PROVIDER_OMIT_FIELDS) delete rest[field];
+  return rest;
+}
+
+/**
+ * Reads `api_key` from the existing provider YAML on disk. Returns the value
+ * only when it's a real key (not the sentinel) — that's the case where the
+ * user wrote a real key locally and we don't want to clobber it.
+ */
+async function readExistingApiKey(filePath: string): Promise<string | undefined> {
+  const file = Bun.file(filePath);
+  if (!(await file.exists())) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = YAML.parse(await file.text());
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const value = (parsed as Record<string, unknown>).api_key;
+  if (typeof value !== "string" || value === PROVIDER_API_KEY_SENTINEL) return undefined;
+  return value;
 }
 
 const TENANT_OMIT_FIELDS = ["id", "slug", "created_at", "updated_at", "settings"] as const;
@@ -102,11 +189,11 @@ async function pullAgent(
   ws: GoClawWSClient,
   tenant: Tenant,
   agent: Agent,
-  tenantPath: string,
+  agentsPath: string,
   schemaPaths: SchemaPaths,
 ): Promise<void> {
   const agentFolder = safeFolderName(agent.agent_key, agent.display_name, agent.id);
-  const agentPath = join(tenantPath, agentFolder);
+  const agentPath = join(agentsPath, agentFolder);
   await mkdir(agentPath, { recursive: true });
 
   console.log(`  [agent] ${agent.display_name ?? agent.agent_key ?? agent.id} → ${agentPath}`);

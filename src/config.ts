@@ -19,7 +19,7 @@ export function loadConfig(): Config {
 
   const userId = Bun.env.GOCLAW_USER_ID?.trim() || "system";
 
-  const outputDir = Bun.env.GOCLAW_OUTPUT_DIR?.trim() || "tenants";
+  const outputDir = Bun.env.GOCLAW_OUTPUT_DIR?.trim() || "goclaw";
 
   return { baseUrl, token, userId, outputDir };
 }

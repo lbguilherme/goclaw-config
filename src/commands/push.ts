@@ -3,7 +3,7 @@ import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
-import { GoClawClient, type Agent, type Tenant } from "../client.ts";
+import { GoClawClient, type Agent, type Provider, type Tenant } from "../client.ts";
 import { loadConfig, type Config } from "../config.ts";
 
 class WSCache {
@@ -28,9 +28,14 @@ class WSCache {
 import {
   AgentSchema,
   CANONICAL_CONTEXT_FILES,
+  PROVIDER_API_KEY_SENTINEL,
+  PROVIDER_DEFAULTS,
+  ProviderSchema,
   TenantSchema,
   agentWorkspaceDefault,
+  providerApiBaseDefault,
   type AgentConfig,
+  type ProviderConfig,
   type TenantConfig,
 } from "../schemas.ts";
 import { canonical } from "../util.ts";
@@ -44,6 +49,7 @@ interface LocalTenant {
   slug: string;
   config: TenantConfig;
   agents: LocalAgent[];
+  providers: LocalProvider[];
 }
 
 interface LocalAgent {
@@ -56,6 +62,15 @@ interface LocalAgent {
   contextFileHashes: Map<string, string>;
   /** Filenames found locally that aren't in the allowlist (e.g. typos, drafts). */
   unknownContextFiles: string[];
+}
+
+interface LocalProvider {
+  /** Slug derived from the YAML filename (without `.yaml`). Becomes `name` server-side. */
+  slug: string;
+  tenantSlug: string;
+  /** Absolute path to the source yaml — used to rewrite api_key → sentinel after push. */
+  yamlPath: string;
+  config: ProviderConfig;
 }
 
 interface ContextFileDiff {
@@ -104,7 +119,27 @@ type AgentPlanAction =
   | { kind: "agent.delete"; tenantSlug: string; slug: string; remoteId: string }
   | { kind: "agent.unchanged"; tenantSlug: string; slug: string };
 
-type PlanAction = TenantPlanAction | AgentPlanAction;
+type ProviderPlanAction =
+  | {
+      kind: "provider.create";
+      tenantSlug: string;
+      slug: string;
+      yamlPath: string;
+      body: Record<string, unknown>;
+    }
+  | {
+      kind: "provider.update";
+      tenantSlug: string;
+      slug: string;
+      remoteId: string;
+      yamlPath: string;
+      updates: Record<string, unknown>;
+      diffs: string[];
+    }
+  | { kind: "provider.delete"; tenantSlug: string; slug: string; remoteId: string }
+  | { kind: "provider.unchanged"; tenantSlug: string; slug: string };
+
+type PlanAction = TenantPlanAction | AgentPlanAction | ProviderPlanAction;
 
 /** PUT /v1/agents/{id} whitelist (see internal/http/validate.go in goclaw). */
 const AGENT_WRITE_FIELDS = [
@@ -152,8 +187,9 @@ export async function push(options: PushOptions): Promise<void> {
   console.log(`→ GoClaw base URL: ${config.baseUrl}`);
   console.log(`→ Reading local config from: ${config.outputDir}`);
 
+  const tenantsDir = join(config.outputDir, "tenants");
   const [localTenants, remoteTenants] = await Promise.all([
-    readLocalTenants(config.outputDir),
+    readLocalTenants(tenantsDir),
     client.listTenants(),
   ]);
 
@@ -161,13 +197,17 @@ export async function push(options: PushOptions): Promise<void> {
   try {
     const tenantPlan = buildTenantPlan(localTenants, remoteTenants);
     const agentPlan = await buildAgentPlan(client, wsCache, localTenants, remoteTenants);
+    const providerPlan = await buildProviderPlan(client, localTenants, remoteTenants);
 
     printUnknownContextFiles(localTenants);
-    const plan: PlanAction[] = [...tenantPlan, ...agentPlan];
+    const plan: PlanAction[] = [...tenantPlan, ...agentPlan, ...providerPlan];
     printPlan(plan);
 
     const mutating = plan.filter(
-      (p) => p.kind !== "tenant.unchanged" && p.kind !== "agent.unchanged",
+      (p) =>
+        p.kind !== "tenant.unchanged" &&
+        p.kind !== "agent.unchanged" &&
+        p.kind !== "provider.unchanged",
     );
     if (mutating.length === 0) {
       console.log("\nNothing to do.");
@@ -179,7 +219,7 @@ export async function push(options: PushOptions): Promise<void> {
       return;
     }
 
-    await applyPlan(client, wsCache, tenantPlan, agentPlan, remoteTenants);
+    await applyPlan(client, wsCache, tenantPlan, agentPlan, providerPlan, remoteTenants);
     console.log("\n✓ Push complete.");
   } finally {
     wsCache.closeAll();
@@ -209,23 +249,92 @@ async function readLocalTenants(outputDir: string): Promise<LocalTenant[]> {
       throw schemaError(yamlPath, "tenant", validated.error.issues);
     }
 
-    const agents = await readLocalAgents(join(outputDir, slug), slug);
-    result.push({ slug, config: validated.data, agents });
+    const tenantDir = join(outputDir, slug);
+    const providers = await readLocalProviders(tenantDir, slug);
+    const agents = await readLocalAgents(tenantDir, slug, providers);
+    result.push({ slug, config: validated.data, agents, providers });
   }
   return result;
 }
 
-async function readLocalAgents(tenantDir: string, tenantSlug: string): Promise<LocalAgent[]> {
+/**
+ * After a successful create/update where a real api_key was sent, rewrite the
+ * local yaml so the key is replaced with the sentinel. Keeps secrets out of
+ * the working tree and makes subsequent pushes a true no-op (the sentinel is
+ * stripped from update payloads). The rewrite is a surgical line replace —
+ * the schema modeline, comments, and other formatting are preserved.
+ *
+ * No-op when the value sent was undefined or already the sentinel.
+ */
+async function sealApiKey(yamlPath: string, sentValue: unknown): Promise<void> {
+  if (typeof sentValue !== "string") return;
+  if (sentValue === PROVIDER_API_KEY_SENTINEL) return;
+  const file = Bun.file(yamlPath);
+  if (!(await file.exists())) return;
+  const text = await file.text();
+  const replaced = text.replace(
+    /^api_key:[ \t]+.*$/m,
+    `api_key: "${PROVIDER_API_KEY_SENTINEL}"`,
+  );
+  if (replaced === text) return;
+  await Bun.write(yamlPath, replaced);
+  console.log(`              └ sealed api_key → "${PROVIDER_API_KEY_SENTINEL}" in ${yamlPath}`);
+}
+
+async function readLocalProviders(
+  tenantDir: string,
+  tenantSlug: string,
+): Promise<LocalProvider[]> {
+  const providersDir = join(tenantDir, "providers");
   let entries: string[];
   try {
-    entries = await readdir(tenantDir);
+    entries = await readdir(providersDir);
   } catch {
     return [];
   }
 
+  const result: LocalProvider[] = [];
+  for (const entry of entries.sort()) {
+    if (!entry.endsWith(".yaml")) continue;
+    const slug = entry.slice(0, -".yaml".length);
+    const yamlPath = join(providersDir, entry);
+    const text = await Bun.file(yamlPath).text();
+    const parsed = parseYaml(text, yamlPath);
+    const validated = ProviderSchema.safeParse(parsed);
+    if (!validated.success) {
+      throw schemaError(yamlPath, "provider", validated.error.issues);
+    }
+    // Refill the per-type api_base default that pull stripped — needed so the
+    // diff against the remote (which carries the real value) doesn't trigger
+    // a spurious update.
+    const config: ProviderConfig = { ...validated.data };
+    if (!config.api_base) {
+      const typeDefault = providerApiBaseDefault(config.provider_type);
+      if (typeDefault !== undefined) config.api_base = typeDefault;
+    }
+    result.push({ slug, tenantSlug, yamlPath, config });
+  }
+  return result;
+}
+
+async function readLocalAgents(
+  tenantDir: string,
+  tenantSlug: string,
+  providers: LocalProvider[],
+): Promise<LocalAgent[]> {
+  const agentsDir = join(tenantDir, "agents");
+  let entries: string[];
+  try {
+    entries = await readdir(agentsDir);
+  } catch {
+    return [];
+  }
+
+  const providerNames = new Set(providers.map((p) => p.slug));
+
   const result: LocalAgent[] = [];
   for (const slug of entries.sort()) {
-    const agentDir = join(tenantDir, slug);
+    const agentDir = join(agentsDir, slug);
     const yamlPath = join(agentDir, "agent.yaml");
     const yamlFile = Bun.file(yamlPath);
     if (!(await yamlFile.exists())) continue;
@@ -240,6 +349,18 @@ async function readLocalAgents(tenantDir: string, tenantSlug: string): Promise<L
     // Fill dynamic defaults that depend on the agent_key (= folder name).
     const config: AgentConfig = { ...validated.data };
     if (!config.workspace) config.workspace = agentWorkspaceDefault(slug);
+
+    // Validate that the agent's `provider` references a provider that exists
+    // locally — otherwise a push would create/update an agent pointing at a
+    // non-existent provider, and the server would reject (or worse, silently
+    // accept and break the agent at runtime).
+    if (!providerNames.has(config.provider)) {
+      const known = [...providerNames].sort().join(", ") || "(none)";
+      throw new Error(
+        `${yamlPath}: agent.provider="${config.provider}" does not match any provider yaml ` +
+          `under ${tenantSlug}/providers/. Known providers: ${known}.`,
+      );
+    }
 
     const description = await readOptionalText(join(agentDir, "DESCRIPTION.md"));
     const { hashes: contextFileHashes, unknown: unknownContextFiles } =
@@ -525,6 +646,157 @@ function buildAgentBody(local: LocalAgent): Record<string, unknown> {
   return body;
 }
 
+// ───────────────────────────── Provider plan ─────────────────────────────
+
+/**
+ * PUT /v1/providers/{id} fields we round-trip from yaml. Server silently
+ * ignores unknown keys, but we keep the list explicit so we don't drift.
+ */
+const PROVIDER_WRITE_FIELDS = [
+  "display_name",
+  "provider_type",
+  "api_base",
+  "api_key",
+  "enabled",
+  "settings",
+] as const;
+
+async function buildProviderPlan(
+  client: GoClawClient,
+  localTenants: LocalTenant[],
+  remoteTenants: Tenant[],
+): Promise<ProviderPlanAction[]> {
+  const remoteTenantBySlug = new Map<string, Tenant>();
+  for (const t of remoteTenants) {
+    if (typeof t.slug === "string") remoteTenantBySlug.set(t.slug, t);
+  }
+
+  const plan: ProviderPlanAction[] = [];
+
+  for (const tenant of localTenants) {
+    const remoteTenant = remoteTenantBySlug.get(tenant.slug);
+    const remoteProviders = remoteTenant
+      ? await client.listProviders(String(remoteTenant.id))
+      : [];
+
+    const remoteByName = new Map<string, Provider>();
+    for (const p of remoteProviders) {
+      if (typeof p.name === "string") remoteByName.set(p.name, p);
+    }
+
+    const handled = new Set<string>();
+
+    for (const local of tenant.providers) {
+      handled.add(local.slug);
+      const match = remoteByName.get(local.slug);
+      if (!match) {
+        // Create requires a real api_key — the sentinel is meaningless to a
+        // brand-new provider, and a missing key would silently lock the user
+        // out of the provider until they push again.
+        const apiKey = local.config.api_key;
+        if (apiKey === PROVIDER_API_KEY_SENTINEL) {
+          throw new Error(
+            `Cannot create provider "${tenant.slug}/${local.slug}": api_key is the sentinel ` +
+              `"${PROVIDER_API_KEY_SENTINEL}". Replace it with the real key in the YAML before pushing.`,
+          );
+        }
+        const body = buildProviderBody(local, /* isCreate */ true);
+        body.name = local.slug;
+        plan.push({
+          kind: "provider.create",
+          tenantSlug: tenant.slug,
+          slug: local.slug,
+          yamlPath: local.yamlPath,
+          body,
+        });
+        continue;
+      }
+      const body = buildProviderBody(local, /* isCreate */ false);
+      const { updates, diffs } = diffProvider(body, match);
+      if (diffs.length === 0) {
+        plan.push({ kind: "provider.unchanged", tenantSlug: tenant.slug, slug: local.slug });
+      } else {
+        plan.push({
+          kind: "provider.update",
+          tenantSlug: tenant.slug,
+          slug: local.slug,
+          remoteId: String(match.id),
+          yamlPath: local.yamlPath,
+          updates,
+          diffs,
+        });
+      }
+    }
+
+    for (const [name, p] of remoteByName) {
+      if (handled.has(name)) continue;
+      plan.push({
+        kind: "provider.delete",
+        tenantSlug: tenant.slug,
+        slug: name,
+        remoteId: String(p.id),
+      });
+    }
+  }
+
+  return plan;
+}
+
+/**
+ * Maps a LocalProvider to the request body. On update, drops `api_key` when
+ * it's the sentinel so the server-side secret survives untouched.
+ */
+function buildProviderBody(local: LocalProvider, isCreate: boolean): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  for (const field of PROVIDER_WRITE_FIELDS) {
+    const value = (local.config as Record<string, unknown>)[field];
+    if (value === undefined) continue;
+    if (field === "api_key" && !isCreate && value === PROVIDER_API_KEY_SENTINEL) continue;
+    body[field] = value;
+  }
+  return body;
+}
+
+/**
+ * Diffs the local body against the remote provider. Skips `api_key` entirely:
+ * the server returns it masked ("***" or the sentinel after a previous push),
+ * so any direct comparison would be a false positive — and `buildProviderBody`
+ * already stripped the sentinel on update.
+ */
+function diffProvider(
+  body: Record<string, unknown>,
+  remote: Provider,
+): { updates: Record<string, unknown>; diffs: string[] } {
+  const updates: Record<string, unknown> = {};
+  const diffs: string[] = [];
+
+  const defaults = PROVIDER_DEFAULTS as unknown as Record<string, unknown>;
+
+  for (const field of Object.keys(body)) {
+    const localValue = body[field];
+    if (field === "api_key") {
+      // Always include in update payload when present locally; we already
+      // stripped the sentinel in buildProviderBody, so a present key means
+      // the user is rotating it.
+      updates[field] = localValue;
+      diffs.push(`${field}: (rotate)`);
+      continue;
+    }
+    const remoteValue = (remote as Record<string, unknown>)[field];
+    // Server omits unset fields from the response. When the local value is
+    // exactly the schema default and the remote field is missing, treat as
+    // equal — otherwise every push would re-send `settings: {}` etc.
+    if (remoteValue === undefined && canonical(localValue) === canonical(defaults[field])) {
+      continue;
+    }
+    if (canonical(localValue) === canonical(remoteValue)) continue;
+    updates[field] = localValue;
+    diffs.push(`${field}: ${shortValue(remoteValue)} → ${shortValue(localValue)}`);
+  }
+
+  return { updates, diffs };
+}
+
 function diffAgent(
   body: Record<string, unknown>,
   remote: Agent,
@@ -570,14 +842,30 @@ function printPlan(plan: PlanAction[]): void {
   const agentMutating = plan.filter(
     (p): p is AgentPlanAction => p.kind.startsWith("agent.") && p.kind !== "agent.unchanged",
   );
+  const providerMutating = plan.filter(
+    (p): p is ProviderPlanAction =>
+      p.kind.startsWith("provider.") && p.kind !== "provider.unchanged",
+  );
 
   console.log("\nPlan:");
-  if (tenantMutating.length === 0 && agentMutating.length === 0) {
+  if (
+    tenantMutating.length === 0 &&
+    agentMutating.length === 0 &&
+    providerMutating.length === 0
+  ) {
     console.log("  (no changes)");
   } else {
     if (tenantMutating.length > 0) {
       console.log("  Tenants:");
       for (const a of tenantMutating) printTenantAction(a);
+    }
+    if (providerMutating.length > 0) {
+      console.log("  Providers:");
+      const byTenant = groupBy(providerMutating, (a) => a.tenantSlug);
+      for (const [tenantSlug, actions] of byTenant) {
+        console.log(`    [${tenantSlug}]`);
+        for (const a of actions) printProviderAction(a);
+      }
     }
     if (agentMutating.length > 0) {
       console.log("  Agents:");
@@ -656,6 +944,27 @@ function shortBody(body: Record<string, unknown>): string {
   return `display_name=${formatValue(display)} provider=${formatValue(body.provider)} model=${formatValue(body.model)}`;
 }
 
+function printProviderAction(a: ProviderPlanAction): void {
+  switch (a.kind) {
+    case "provider.create":
+      console.log(
+        `      + create   ${a.slug}  provider_type=${formatValue(a.body.provider_type)} ` +
+          `api_base=${formatValue(a.body.api_base)}`,
+      );
+      break;
+    case "provider.update":
+      console.log(`      ~ update   ${a.slug}`);
+      for (const d of a.diffs) console.log(`                  ${d}`);
+      break;
+    case "provider.delete":
+      console.log(`      - delete   ${a.slug}  (id=${a.remoteId})`);
+      break;
+    case "provider.unchanged":
+      console.log(`      = unchanged ${a.slug}`);
+      break;
+  }
+}
+
 function shortValue(v: unknown): string {
   if (v === undefined) return "(unset)";
   if (v === null) return "null";
@@ -674,6 +983,7 @@ async function applyPlan(
   wsCache: WSCache,
   tenantPlan: TenantPlanAction[],
   agentPlan: AgentPlanAction[],
+  providerPlan: ProviderPlanAction[],
   remoteTenants: Tenant[],
 ): Promise<void> {
   console.log("\nApplying...");
@@ -708,6 +1018,42 @@ async function applyPlan(
         console.log(`    - archived ${a.slug}`);
         break;
       case "tenant.unchanged":
+        break;
+    }
+  }
+
+  // Providers are applied before agents because agent.provider references
+  // the provider name; creating an agent that points to a missing provider
+  // would fail server-side.
+  console.log("  Providers:");
+  for (const a of providerPlan) {
+    const tenantId = tenantIdBySlug.get(a.tenantSlug);
+    if (!tenantId) {
+      throw new Error(
+        `Cannot apply provider action for tenant slug "${a.tenantSlug}" — tenant id not resolved.`,
+      );
+    }
+    switch (a.kind) {
+      case "provider.create": {
+        const created = await client.createProvider(tenantId, a.body);
+        console.log(`    + created  ${a.tenantSlug}/${a.slug} (id=${created.id})`);
+        await sealApiKey(a.yamlPath, a.body.api_key);
+        break;
+      }
+      case "provider.update":
+        if (Object.keys(a.updates).length > 0) {
+          await client.updateProvider(a.remoteId, tenantId, a.updates);
+          console.log(
+            `    ~ updated  ${a.tenantSlug}/${a.slug} (${Object.keys(a.updates).length} field(s))`,
+          );
+          await sealApiKey(a.yamlPath, a.updates.api_key);
+        }
+        break;
+      case "provider.delete":
+        await client.deleteProvider(a.remoteId, tenantId);
+        console.log(`    - deleted  ${a.tenantSlug}/${a.slug}`);
+        break;
+      case "provider.unchanged":
         break;
     }
   }

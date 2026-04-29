@@ -32,7 +32,7 @@ Environment:
   GOCLAW_GATEWAY_TOKEN  (required) bearer token for the GoClaw gateway
   GOCLAW_BASE_URL       (optional) gateway base URL, default http://localhost:18790
   GOCLAW_USER_ID        (optional) X-GoClaw-User-Id header, default "system"
-  GOCLAW_OUTPUT_DIR     (optional) output folder, default ./tenants
+  GOCLAW_OUTPUT_DIR     (optional) output folder, default ./goclaw
 `);
 }
 

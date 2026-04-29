@@ -14,6 +14,14 @@ export interface Agent {
   [key: string]: unknown;
 }
 
+export interface Provider {
+  id: string;
+  name?: string;
+  tenant_id?: string;
+  provider_type?: string;
+  [key: string]: unknown;
+}
+
 export class GoClawClient {
   constructor(private readonly config: Config) {}
 
@@ -111,6 +119,43 @@ export class GoClawClient {
 
   async deleteAgent(agentId: string, tenantId: string): Promise<void> {
     await this.request(`/v1/agents/${encodeURIComponent(agentId)}`, {
+      method: "DELETE",
+      tenantId,
+    });
+  }
+
+  async listProviders(tenantId: string): Promise<Provider[]> {
+    const data = await this.json<Provider[] | { providers?: Provider[]; data?: Provider[] }>(
+      "/v1/providers",
+      { tenantId },
+    );
+    return normalizeList<Provider>(data, ["providers", "data"]);
+  }
+
+  async createProvider(tenantId: string, body: Record<string, unknown>): Promise<Provider> {
+    return await this.json<Provider>("/v1/providers", {
+      method: "POST",
+      tenantId,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async updateProvider(
+    providerId: string,
+    tenantId: string,
+    updates: Record<string, unknown>,
+  ): Promise<void> {
+    await this.request(`/v1/providers/${encodeURIComponent(providerId)}`, {
+      method: "PUT",
+      tenantId,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    });
+  }
+
+  async deleteProvider(providerId: string, tenantId: string): Promise<void> {
+    await this.request(`/v1/providers/${encodeURIComponent(providerId)}`, {
       method: "DELETE",
       tenantId,
     });

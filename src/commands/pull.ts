@@ -3,18 +3,24 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { ZodType } from "zod";
 
-import { GoClawClient, type Agent, type Provider, type Tenant } from "../client.ts";
+import { GoClawClient, type Agent, type McpServer, type Provider, type Skill, type Tenant } from "../client.ts";
 import { loadConfig } from "../config.ts";
 import {
   AGENT_DEFAULTS,
   AgentSchema,
   CANONICAL_CONTEXT_FILES,
+  MCP_HEADER_SECRET_SENTINEL,
+  MCP_SERVER_DEFAULTS,
+  McpServerSchema,
   PROVIDER_API_KEY_SENTINEL,
   PROVIDER_DEFAULTS,
   ProviderSchema,
+  SKILL_DEFAULTS,
+  SkillSchema,
   TENANT_DEFAULTS,
   TenantSchema,
   agentWorkspaceDefault,
+  isSensitiveHeaderKey,
   providerApiBaseDefault,
   stripDefaults,
 } from "../schemas.ts";
@@ -22,17 +28,32 @@ import { writeJsonSchemas, type SchemaPaths } from "../schema-output.ts";
 import { safeFolderName } from "../slug.ts";
 import { GoClawWSClient } from "../ws-client.ts";
 
-export async function pull(): Promise<void> {
+export interface PullOptions {
+  tenantSlug?: string;
+}
+
+export async function pull(options: PullOptions = {}): Promise<void> {
   const config = loadConfig();
   const client = new GoClawClient(config);
 
   console.log(`→ GoClaw base URL: ${config.baseUrl}`);
   console.log(`→ Output directory: ${config.outputDir}`);
+  if (options.tenantSlug) {
+    console.log(`→ Scoped to tenant: ${options.tenantSlug}`);
+  }
 
   const schemaPaths = await writeJsonSchemas();
 
   const allTenants = await client.listTenants();
-  const tenants = allTenants.filter((t) => t.status !== "archived");
+  let tenants = allTenants.filter((t) => t.status !== "archived");
+
+  if (options.tenantSlug) {
+    tenants = tenants.filter((t) => t.slug === options.tenantSlug);
+    if (tenants.length === 0) {
+      console.log(`No active tenant matched slug "${options.tenantSlug}".`);
+      return;
+    }
+  }
 
   if (tenants.length === 0) {
     console.log("No active tenants returned by the API.");
@@ -73,6 +94,8 @@ async function pullTenant(
   );
 
   await pullProviders(client, tenant, tenantPath, schemaPaths);
+  await pullMcpServers(client, tenant, tenantPath, schemaPaths);
+  await pullSkills(client, tenant, tenantPath, schemaPaths);
 
   const agents = await client.listAgents(tenant.id);
   if (agents.length === 0) return;
@@ -145,6 +168,163 @@ async function pullProviders(
 function stripProviderFields(provider: Provider): Record<string, unknown> {
   const rest: Record<string, unknown> = { ...provider };
   for (const field of PROVIDER_OMIT_FIELDS) delete rest[field];
+  return rest;
+}
+
+const MCP_OMIT_FIELDS = [
+  "id",
+  "created_at",
+  "updated_at",
+  "tenant_id",
+  "name",
+  "created_by",
+  "agent_count",
+] as const;
+
+/**
+ * Pulls MCP servers for a tenant. Header values that look like credentials
+ * (`Authorization`, `*-api-key`, `*-token`, etc.) are masked with the sentinel,
+ * preserving any real values already on disk so a subsequent push can rotate.
+ */
+async function pullMcpServers(
+  client: GoClawClient,
+  tenant: Tenant,
+  tenantPath: string,
+  schemaPaths: SchemaPaths,
+): Promise<void> {
+  const servers = await client.listMcpServers(tenant.id);
+  if (servers.length === 0) return;
+
+  const mcpsPath = join(tenantPath, "mcps");
+  await mkdir(mcpsPath, { recursive: true });
+
+  for (const server of servers) {
+    const slug = safeFolderName(server.name, server.id);
+    const filePath = join(mcpsPath, `${slug}.yaml`);
+    console.log(`  [mcp] ${server.name ?? server.id} → ${filePath}`);
+
+    const data = stripMcpFields(server);
+    if (data.headers && typeof data.headers === "object") {
+      const existing = await readExistingMcpHeaders(filePath);
+      data.headers = maskSensitiveHeaders(
+        data.headers as Record<string, string>,
+        existing,
+      );
+    }
+
+    await writeYaml(
+      filePath,
+      data,
+      McpServerSchema,
+      MCP_SERVER_DEFAULTS,
+      schemaPaths.urls.mcp,
+      `mcp ${server.name ?? server.id}`,
+    );
+  }
+}
+
+function stripMcpFields(server: McpServer): Record<string, unknown> {
+  const rest: Record<string, unknown> = { ...server };
+  for (const field of MCP_OMIT_FIELDS) delete rest[field];
+  return rest;
+}
+
+/**
+ * Replaces sensitive header values with the sentinel. If `existing` already
+ * contains a real (non-sentinel) value for a sensitive header, that value is
+ * kept on disk so the user can rotate without first pulling the secret from
+ * the server.
+ */
+function maskSensitiveHeaders(
+  headers: Record<string, string>,
+  existing: Record<string, string>,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (!isSensitiveHeaderKey(name)) {
+      result[name] = value;
+      continue;
+    }
+    const prior = existing[name];
+    if (typeof prior === "string" && prior !== MCP_HEADER_SECRET_SENTINEL) {
+      result[name] = prior;
+    } else {
+      result[name] = MCP_HEADER_SECRET_SENTINEL;
+    }
+  }
+  return result;
+}
+
+async function readExistingMcpHeaders(filePath: string): Promise<Record<string, string>> {
+  const file = Bun.file(filePath);
+  if (!(await file.exists())) return {};
+  let parsed: unknown;
+  try {
+    parsed = YAML.parse(await file.text());
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== "object") return {};
+  const headers = (parsed as Record<string, unknown>).headers;
+  if (!headers || typeof headers !== "object") return {};
+  const result: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
+    if (typeof v === "string") result[k] = v;
+  }
+  return result;
+}
+
+const SKILL_OMIT_FIELDS = ["id", "created_at", "updated_at", "tenant_id", "path", "baseDir"] as const;
+
+/**
+ * Pulls non-system skills for a tenant. System skills (is_system: true) are
+ * platform-managed and excluded — syncing them via this CLI would be a no-op
+ * at best and would clobber server-side defaults at worst.
+ */
+async function pullSkills(
+  client: GoClawClient,
+  tenant: Tenant,
+  tenantPath: string,
+  schemaPaths: SchemaPaths,
+): Promise<void> {
+  const all = await client.listSkills(tenant.id);
+  const userSkills = all.filter((s) => s.is_system !== true);
+  const systemCount = all.length - userSkills.length;
+
+  if (userSkills.length === 0) {
+    if (systemCount > 0) {
+      console.log(`  [skills] 0 user skill(s); ${systemCount} system skill(s) skipped`);
+    }
+    return;
+  }
+
+  const skillsPath = join(tenantPath, "skills");
+  await mkdir(skillsPath, { recursive: true });
+
+  for (const skill of userSkills) {
+    const slug = safeFolderName(skill.slug, skill.name, skill.id);
+    const filePath = join(skillsPath, `${slug}.yaml`);
+    console.log(`  [skill] ${skill.name ?? skill.slug ?? skill.id} → ${filePath}`);
+
+    const data = stripSkillFields(skill);
+    await writeYaml(
+      filePath,
+      data,
+      SkillSchema,
+      SKILL_DEFAULTS,
+      schemaPaths.urls.skill,
+      `skill ${skill.name ?? skill.slug ?? skill.id}`,
+    );
+  }
+
+  if (systemCount > 0) {
+    console.log(`  [skills] ${systemCount} system skill(s) skipped`);
+  }
+}
+
+function stripSkillFields(skill: Skill): Record<string, unknown> {
+  const rest: Record<string, unknown> = { ...skill };
+  for (const field of SKILL_OMIT_FIELDS) delete rest[field];
   return rest;
 }
 

@@ -3,7 +3,14 @@ import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
-import { GoClawClient, type Agent, type Provider, type Tenant } from "../client.ts";
+import {
+  GoClawClient,
+  type Agent,
+  type McpServer,
+  type Provider,
+  type Skill,
+  type Tenant,
+} from "../client.ts";
 import { loadConfig, type Config } from "../config.ts";
 
 class WSCache {
@@ -28,14 +35,23 @@ class WSCache {
 import {
   AgentSchema,
   CANONICAL_CONTEXT_FILES,
+  MCP_HEADER_SECRET_SENTINEL,
+  MCP_SERVER_DEFAULTS,
+  McpServerSchema,
   PROVIDER_API_KEY_SENTINEL,
   PROVIDER_DEFAULTS,
   ProviderSchema,
+  SKILL_DEFAULTS,
+  SKILL_WRITE_FIELDS,
+  SkillSchema,
   TenantSchema,
   agentWorkspaceDefault,
+  isSensitiveHeaderKey,
   providerApiBaseDefault,
   type AgentConfig,
+  type McpServerConfig,
   type ProviderConfig,
+  type SkillConfig,
   type TenantConfig,
 } from "../schemas.ts";
 import { canonical } from "../util.ts";
@@ -43,6 +59,7 @@ import { GoClawWSClient } from "../ws-client.ts";
 
 export interface PushOptions {
   yes: boolean;
+  tenantSlug?: string;
 }
 
 interface LocalTenant {
@@ -50,6 +67,25 @@ interface LocalTenant {
   config: TenantConfig;
   agents: LocalAgent[];
   providers: LocalProvider[];
+  mcpServers: LocalMcpServer[];
+  skills: LocalSkill[];
+}
+
+interface LocalMcpServer {
+  /** Slug derived from the YAML filename (= server `name` server-side). */
+  slug: string;
+  tenantSlug: string;
+  /** Absolute yaml path — used to seal sensitive headers back to sentinel after push. */
+  yamlPath: string;
+  config: McpServerConfig;
+}
+
+interface LocalSkill {
+  /** Slug derived from the YAML filename. */
+  slug: string;
+  tenantSlug: string;
+  yamlPath: string;
+  config: SkillConfig;
 }
 
 interface LocalAgent {
@@ -139,7 +175,46 @@ type ProviderPlanAction =
   | { kind: "provider.delete"; tenantSlug: string; slug: string; remoteId: string }
   | { kind: "provider.unchanged"; tenantSlug: string; slug: string };
 
-type PlanAction = TenantPlanAction | AgentPlanAction | ProviderPlanAction;
+type McpPlanAction =
+  | {
+      kind: "mcp.create";
+      tenantSlug: string;
+      slug: string;
+      yamlPath: string;
+      body: Record<string, unknown>;
+    }
+  | {
+      kind: "mcp.update";
+      tenantSlug: string;
+      slug: string;
+      remoteId: string;
+      yamlPath: string;
+      updates: Record<string, unknown>;
+      diffs: string[];
+    }
+  | { kind: "mcp.delete"; tenantSlug: string; slug: string; remoteId: string }
+  | { kind: "mcp.unchanged"; tenantSlug: string; slug: string };
+
+type SkillPlanAction =
+  | {
+      kind: "skill.update";
+      tenantSlug: string;
+      slug: string;
+      remoteId: string;
+      updates: Record<string, unknown>;
+      diffs: string[];
+    }
+  | { kind: "skill.delete"; tenantSlug: string; slug: string; remoteId: string }
+  | { kind: "skill.unchanged"; tenantSlug: string; slug: string }
+  /** Local yaml exists but no remote match — create requires `goclaw skills upload`. */
+  | { kind: "skill.skip-create"; tenantSlug: string; slug: string };
+
+type PlanAction =
+  | TenantPlanAction
+  | AgentPlanAction
+  | ProviderPlanAction
+  | McpPlanAction
+  | SkillPlanAction;
 
 /** PUT /v1/agents/{id} whitelist (see internal/http/validate.go in goclaw). */
 const AGENT_WRITE_FIELDS = [
@@ -186,28 +261,52 @@ export async function push(options: PushOptions): Promise<void> {
 
   console.log(`→ GoClaw base URL: ${config.baseUrl}`);
   console.log(`→ Reading local config from: ${config.outputDir}`);
+  if (options.tenantSlug) {
+    console.log(`→ Scoped to tenant: ${options.tenantSlug}`);
+  }
 
   const tenantsDir = join(config.outputDir, "tenants");
-  const [localTenants, remoteTenants] = await Promise.all([
+  let [localTenants, remoteTenants] = await Promise.all([
     readLocalTenants(tenantsDir),
     client.listTenants(),
   ]);
+
+  if (options.tenantSlug) {
+    const slug = options.tenantSlug;
+    localTenants = localTenants.filter((t) => t.slug === slug);
+    remoteTenants = remoteTenants.filter((t) => t.slug === slug);
+    if (localTenants.length === 0 && remoteTenants.length === 0) {
+      console.log(`No tenant matched slug "${slug}" locally or remotely.`);
+      return;
+    }
+  }
 
   const wsCache = new WSCache(config);
   try {
     const tenantPlan = buildTenantPlan(localTenants, remoteTenants);
     const agentPlan = await buildAgentPlan(client, wsCache, localTenants, remoteTenants);
     const providerPlan = await buildProviderPlan(client, localTenants, remoteTenants);
+    const mcpPlan = await buildMcpPlan(client, localTenants, remoteTenants);
+    const skillPlan = await buildSkillPlan(client, localTenants, remoteTenants);
 
     printUnknownContextFiles(localTenants);
-    const plan: PlanAction[] = [...tenantPlan, ...agentPlan, ...providerPlan];
+    const plan: PlanAction[] = [
+      ...tenantPlan,
+      ...agentPlan,
+      ...providerPlan,
+      ...mcpPlan,
+      ...skillPlan,
+    ];
     printPlan(plan);
 
     const mutating = plan.filter(
       (p) =>
         p.kind !== "tenant.unchanged" &&
         p.kind !== "agent.unchanged" &&
-        p.kind !== "provider.unchanged",
+        p.kind !== "provider.unchanged" &&
+        p.kind !== "mcp.unchanged" &&
+        p.kind !== "skill.unchanged" &&
+        p.kind !== "skill.skip-create",
     );
     if (mutating.length === 0) {
       console.log("\nNothing to do.");
@@ -219,7 +318,16 @@ export async function push(options: PushOptions): Promise<void> {
       return;
     }
 
-    await applyPlan(client, wsCache, tenantPlan, agentPlan, providerPlan, remoteTenants);
+    await applyPlan(
+      client,
+      wsCache,
+      tenantPlan,
+      agentPlan,
+      providerPlan,
+      mcpPlan,
+      skillPlan,
+      remoteTenants,
+    );
     console.log("\n✓ Push complete.");
   } finally {
     wsCache.closeAll();
@@ -252,7 +360,16 @@ async function readLocalTenants(outputDir: string): Promise<LocalTenant[]> {
     const tenantDir = join(outputDir, slug);
     const providers = await readLocalProviders(tenantDir, slug);
     const agents = await readLocalAgents(tenantDir, slug, providers);
-    result.push({ slug, config: validated.data, agents, providers });
+    const mcpServers = await readLocalMcpServers(tenantDir, slug);
+    const skills = await readLocalSkills(tenantDir, slug);
+    result.push({
+      slug,
+      config: validated.data,
+      agents,
+      providers,
+      mcpServers,
+      skills,
+    });
   }
   return result;
 }
@@ -317,6 +434,59 @@ async function readLocalProviders(
   return result;
 }
 
+async function readLocalMcpServers(
+  tenantDir: string,
+  tenantSlug: string,
+): Promise<LocalMcpServer[]> {
+  const mcpsDir = join(tenantDir, "mcps");
+  let entries: string[];
+  try {
+    entries = await readdir(mcpsDir);
+  } catch {
+    return [];
+  }
+
+  const result: LocalMcpServer[] = [];
+  for (const entry of entries.sort()) {
+    if (!entry.endsWith(".yaml")) continue;
+    const slug = entry.slice(0, -".yaml".length);
+    const yamlPath = join(mcpsDir, entry);
+    const text = await Bun.file(yamlPath).text();
+    const parsed = parseYaml(text, yamlPath);
+    const validated = McpServerSchema.safeParse(parsed);
+    if (!validated.success) {
+      throw schemaError(yamlPath, "mcp", validated.error.issues);
+    }
+    result.push({ slug, tenantSlug, yamlPath, config: validated.data });
+  }
+  return result;
+}
+
+async function readLocalSkills(tenantDir: string, tenantSlug: string): Promise<LocalSkill[]> {
+  const skillsDir = join(tenantDir, "skills");
+  let entries: string[];
+  try {
+    entries = await readdir(skillsDir);
+  } catch {
+    return [];
+  }
+
+  const result: LocalSkill[] = [];
+  for (const entry of entries.sort()) {
+    if (!entry.endsWith(".yaml")) continue;
+    const slug = entry.slice(0, -".yaml".length);
+    const yamlPath = join(skillsDir, entry);
+    const text = await Bun.file(yamlPath).text();
+    const parsed = parseYaml(text, yamlPath);
+    const validated = SkillSchema.safeParse(parsed);
+    if (!validated.success) {
+      throw schemaError(yamlPath, "skill", validated.error.issues);
+    }
+    result.push({ slug, tenantSlug, yamlPath, config: validated.data });
+  }
+  return result;
+}
+
 async function readLocalAgents(
   tenantDir: string,
   tenantSlug: string,
@@ -350,15 +520,17 @@ async function readLocalAgents(
     const config: AgentConfig = { ...validated.data };
     if (!config.workspace) config.workspace = agentWorkspaceDefault(slug);
 
-    // Validate that the agent's `provider` references a provider that exists
-    // locally — otherwise a push would create/update an agent pointing at a
-    // non-existent provider, and the server would reject (or worse, silently
-    // accept and break the agent at runtime).
+    // `agent.provider` may reference either a tenant-configured provider
+    // (one of our local yamls) or a built-in/system provider that has no
+    // tenant-level config row. Surface a warning when there's no local match,
+    // but let the server be the final authority — it will reject an unknown
+    // provider on its own.
     if (!providerNames.has(config.provider)) {
       const known = [...providerNames].sort().join(", ") || "(none)";
-      throw new Error(
-        `${yamlPath}: agent.provider="${config.provider}" does not match any provider yaml ` +
-          `under ${tenantSlug}/providers/. Known providers: ${known}.`,
+      console.warn(
+        `  warn: ${tenantSlug}/${slug} agent.provider="${config.provider}" has no local yaml ` +
+          `under ${tenantSlug}/providers/. Assuming a built-in/system provider. ` +
+          `Tenant providers: ${known}.`,
       );
     }
 
@@ -797,6 +969,327 @@ function diffProvider(
   return { updates, diffs };
 }
 
+// ───────────────────────────── MCP plan ─────────────────────────────
+
+const MCP_WRITE_FIELDS = [
+  "display_name",
+  "transport",
+  "command",
+  "args",
+  "url",
+  "prefix",
+  "timeout_sec",
+  "headers",
+  "env",
+  "settings",
+  "enabled",
+] as const;
+
+async function buildMcpPlan(
+  client: GoClawClient,
+  localTenants: LocalTenant[],
+  remoteTenants: Tenant[],
+): Promise<McpPlanAction[]> {
+  const remoteTenantBySlug = new Map<string, Tenant>();
+  for (const t of remoteTenants) {
+    if (typeof t.slug === "string") remoteTenantBySlug.set(t.slug, t);
+  }
+
+  const plan: McpPlanAction[] = [];
+  for (const tenant of localTenants) {
+    const remoteTenant = remoteTenantBySlug.get(tenant.slug);
+    const remote = remoteTenant ? await client.listMcpServers(String(remoteTenant.id)) : [];
+
+    const remoteByName = new Map<string, McpServer>();
+    for (const s of remote) {
+      if (typeof s.name === "string") remoteByName.set(s.name, s);
+    }
+
+    const handled = new Set<string>();
+    for (const local of tenant.mcpServers) {
+      handled.add(local.slug);
+      const match = remoteByName.get(local.slug);
+      if (!match) {
+        const body = buildMcpBody(local, /* isCreate */ true);
+        body.name = local.slug;
+        plan.push({
+          kind: "mcp.create",
+          tenantSlug: tenant.slug,
+          slug: local.slug,
+          yamlPath: local.yamlPath,
+          body,
+        });
+        continue;
+      }
+      const body = buildMcpBody(local, /* isCreate */ false);
+      const { updates, diffs } = diffMcp(body, match, local.config);
+      if (diffs.length === 0) {
+        plan.push({ kind: "mcp.unchanged", tenantSlug: tenant.slug, slug: local.slug });
+      } else {
+        plan.push({
+          kind: "mcp.update",
+          tenantSlug: tenant.slug,
+          slug: local.slug,
+          remoteId: String(match.id),
+          yamlPath: local.yamlPath,
+          updates,
+          diffs,
+        });
+      }
+    }
+
+    for (const [name, s] of remoteByName) {
+      if (handled.has(name)) continue;
+      plan.push({
+        kind: "mcp.delete",
+        tenantSlug: tenant.slug,
+        slug: name,
+        remoteId: String(s.id),
+      });
+    }
+  }
+  return plan;
+}
+
+/**
+ * Builds a request body. On update, headers whose value equals the sentinel
+ * are stripped (preserve server-side secret). On create, sentinels are an
+ * error — the user must supply a real value.
+ */
+function buildMcpBody(local: LocalMcpServer, isCreate: boolean): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  for (const field of MCP_WRITE_FIELDS) {
+    const value = (local.config as Record<string, unknown>)[field];
+    if (value === undefined) continue;
+    if (field === "headers" && value && typeof value === "object") {
+      const cleaned: Record<string, string> = {};
+      for (const [name, v] of Object.entries(value as Record<string, string>)) {
+        if (v === MCP_HEADER_SECRET_SENTINEL) {
+          if (isCreate) {
+            throw new Error(
+              `Cannot create MCP "${local.tenantSlug}/${local.slug}": header "${name}" is the ` +
+                `sentinel "${MCP_HEADER_SECRET_SENTINEL}". Replace it with the real value first.`,
+            );
+          }
+          // On update, drop the sentinel header entirely → server keeps prior value.
+          continue;
+        }
+        cleaned[name] = v;
+      }
+      body[field] = cleaned;
+      continue;
+    }
+    body[field] = value;
+  }
+  return body;
+}
+
+/**
+ * Diffs the local body against the remote MCP. Sentinel headers were already
+ * stripped from `body` upstream; any header still present locally is treated
+ * as a rotation target and surfaces as a single `headers: (rotate <names>)`
+ * diff entry — the actual values aren't echoed to console for safety.
+ */
+function diffMcp(
+  body: Record<string, unknown>,
+  remote: McpServer,
+  localConfig: McpServerConfig,
+): { updates: Record<string, unknown>; diffs: string[] } {
+  const updates: Record<string, unknown> = {};
+  const diffs: string[] = [];
+
+  const defaults = MCP_SERVER_DEFAULTS as unknown as Record<string, unknown>;
+
+  for (const field of Object.keys(body)) {
+    const localValue = body[field];
+    const remoteValue = (remote as Record<string, unknown>)[field];
+
+    if (field === "headers") {
+      const result = diffHeaders(
+        localValue as Record<string, string>,
+        (remoteValue as Record<string, string> | undefined) ?? {},
+        localConfig.headers ?? {},
+      );
+      if (result.changed) {
+        updates[field] = localValue;
+        diffs.push(...result.diffs);
+      }
+      continue;
+    }
+
+    if (remoteValue === undefined && canonical(localValue) === canonical(defaults[field])) {
+      continue;
+    }
+    if (canonical(localValue) === canonical(remoteValue)) continue;
+    updates[field] = localValue;
+    diffs.push(`${field}: ${shortValue(remoteValue)} → ${shortValue(localValue)}`);
+  }
+
+  return { updates, diffs };
+}
+
+function diffHeaders(
+  localBody: Record<string, string>,
+  remote: Record<string, string>,
+  localFull: Record<string, string>,
+): { changed: boolean; diffs: string[] } {
+  const diffs: string[] = [];
+  const rotated: string[] = [];
+  let changed = false;
+
+  for (const [name, value] of Object.entries(localBody)) {
+    if (isSensitiveHeaderKey(name)) {
+      // localBody never contains the sentinel (stripped in buildMcpBody) — its
+      // mere presence here means the user wrote a real value to rotate.
+      rotated.push(name);
+      changed = true;
+      continue;
+    }
+    if (canonical(value) !== canonical(remote[name])) {
+      diffs.push(`headers.${name}: ${shortValue(remote[name])} → ${shortValue(value)}`);
+      changed = true;
+    }
+  }
+  // Non-sensitive headers removed locally vs. remote → diff. Sensitive ones we
+  // intentionally leave alone (sentinel = "keep server value").
+  for (const name of Object.keys(remote)) {
+    if (isSensitiveHeaderKey(name)) continue;
+    if (!(name in localFull)) {
+      diffs.push(`headers.${name}: ${shortValue(remote[name])} → (removed)`);
+      changed = true;
+    }
+  }
+  if (rotated.length > 0) {
+    diffs.unshift(`headers: (rotate ${rotated.sort().join(", ")})`);
+  }
+  return { changed, diffs };
+}
+
+/**
+ * After a successful mcp create/update, rewrite sensitive header values in the
+ * yaml back to the sentinel so the working tree never holds plaintext secrets.
+ */
+async function sealMcpHeaders(yamlPath: string, sentBody: Record<string, unknown>): Promise<void> {
+  const headers = sentBody.headers;
+  if (!headers || typeof headers !== "object") return;
+  const sensitive = Object.entries(headers as Record<string, unknown>).filter(
+    ([name, value]) =>
+      isSensitiveHeaderKey(name) &&
+      typeof value === "string" &&
+      value !== MCP_HEADER_SECRET_SENTINEL,
+  );
+  if (sensitive.length === 0) return;
+
+  const file = Bun.file(yamlPath);
+  if (!(await file.exists())) return;
+  const text = await file.text();
+  let replaced = text;
+  for (const [name] of sensitive) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`^(\\s+)${escaped}:[ \\t]+.*$`, "m");
+    replaced = replaced.replace(re, `$1${name}: "${MCP_HEADER_SECRET_SENTINEL}"`);
+  }
+  if (replaced === text) return;
+  await Bun.write(yamlPath, replaced);
+  console.log(
+    `              └ sealed ${sensitive.length} header(s) → "${MCP_HEADER_SECRET_SENTINEL}" in ${yamlPath}`,
+  );
+}
+
+// ───────────────────────────── Skill plan ─────────────────────────────
+
+async function buildSkillPlan(
+  client: GoClawClient,
+  localTenants: LocalTenant[],
+  remoteTenants: Tenant[],
+): Promise<SkillPlanAction[]> {
+  const remoteTenantBySlug = new Map<string, Tenant>();
+  for (const t of remoteTenants) {
+    if (typeof t.slug === "string") remoteTenantBySlug.set(t.slug, t);
+  }
+
+  const plan: SkillPlanAction[] = [];
+  for (const tenant of localTenants) {
+    const remoteTenant = remoteTenantBySlug.get(tenant.slug);
+    const remote = remoteTenant ? await client.listSkills(String(remoteTenant.id)) : [];
+
+    // Index by both slug and name to be tolerant of either being the local
+    // filename. System skills are ignored — never touched by this CLI.
+    const remoteBySlug = new Map<string, Skill>();
+    for (const s of remote) {
+      if (s.is_system === true) continue;
+      const key = typeof s.slug === "string" ? s.slug : s.name;
+      if (typeof key === "string") remoteBySlug.set(key, s);
+    }
+
+    const handled = new Set<string>();
+    for (const local of tenant.skills) {
+      handled.add(local.slug);
+      const match = remoteBySlug.get(local.slug);
+      if (!match) {
+        plan.push({ kind: "skill.skip-create", tenantSlug: tenant.slug, slug: local.slug });
+        continue;
+      }
+      const body = buildSkillBody(local);
+      const { updates, diffs } = diffSkill(body, match);
+      if (diffs.length === 0) {
+        plan.push({ kind: "skill.unchanged", tenantSlug: tenant.slug, slug: local.slug });
+      } else {
+        plan.push({
+          kind: "skill.update",
+          tenantSlug: tenant.slug,
+          slug: local.slug,
+          remoteId: String(match.id),
+          updates,
+          diffs,
+        });
+      }
+    }
+
+    for (const [slug, s] of remoteBySlug) {
+      if (handled.has(slug)) continue;
+      plan.push({
+        kind: "skill.delete",
+        tenantSlug: tenant.slug,
+        slug,
+        remoteId: String(s.id),
+      });
+    }
+  }
+  return plan;
+}
+
+function buildSkillBody(local: LocalSkill): Record<string, unknown> {
+  const body: Record<string, unknown> = {};
+  for (const field of SKILL_WRITE_FIELDS) {
+    const value = (local.config as Record<string, unknown>)[field];
+    if (value === undefined) continue;
+    body[field] = value;
+  }
+  return body;
+}
+
+function diffSkill(
+  body: Record<string, unknown>,
+  remote: Skill,
+): { updates: Record<string, unknown>; diffs: string[] } {
+  const updates: Record<string, unknown> = {};
+  const diffs: string[] = [];
+  const defaults = SKILL_DEFAULTS as unknown as Record<string, unknown>;
+
+  for (const field of Object.keys(body)) {
+    const localValue = body[field];
+    const remoteValue = (remote as Record<string, unknown>)[field];
+    if (remoteValue === undefined && canonical(localValue) === canonical(defaults[field])) {
+      continue;
+    }
+    if (canonical(localValue) === canonical(remoteValue)) continue;
+    updates[field] = localValue;
+    diffs.push(`${field}: ${shortValue(remoteValue)} → ${shortValue(localValue)}`);
+  }
+  return { updates, diffs };
+}
+
 function diffAgent(
   body: Record<string, unknown>,
   remote: Agent,
@@ -846,12 +1339,20 @@ function printPlan(plan: PlanAction[]): void {
     (p): p is ProviderPlanAction =>
       p.kind.startsWith("provider.") && p.kind !== "provider.unchanged",
   );
+  const mcpMutating = plan.filter(
+    (p): p is McpPlanAction => p.kind.startsWith("mcp.") && p.kind !== "mcp.unchanged",
+  );
+  const skillMutating = plan.filter(
+    (p): p is SkillPlanAction => p.kind.startsWith("skill.") && p.kind !== "skill.unchanged",
+  );
 
   console.log("\nPlan:");
   if (
     tenantMutating.length === 0 &&
     agentMutating.length === 0 &&
-    providerMutating.length === 0
+    providerMutating.length === 0 &&
+    mcpMutating.length === 0 &&
+    skillMutating.length === 0
   ) {
     console.log("  (no changes)");
   } else {
@@ -865,6 +1366,22 @@ function printPlan(plan: PlanAction[]): void {
       for (const [tenantSlug, actions] of byTenant) {
         console.log(`    [${tenantSlug}]`);
         for (const a of actions) printProviderAction(a);
+      }
+    }
+    if (mcpMutating.length > 0) {
+      console.log("  MCP servers:");
+      const byTenant = groupBy(mcpMutating, (a) => a.tenantSlug);
+      for (const [tenantSlug, actions] of byTenant) {
+        console.log(`    [${tenantSlug}]`);
+        for (const a of actions) printMcpAction(a);
+      }
+    }
+    if (skillMutating.length > 0) {
+      console.log("  Skills:");
+      const byTenant = groupBy(skillMutating, (a) => a.tenantSlug);
+      for (const [tenantSlug, actions] of byTenant) {
+        console.log(`    [${tenantSlug}]`);
+        for (const a of actions) printSkillAction(a);
       }
     }
     if (agentMutating.length > 0) {
@@ -886,6 +1403,55 @@ function printPlan(plan: PlanAction[]): void {
         `GoClaw merge-import cannot delete them — they will remain on the server:`,
     );
     for (const o of orphans) console.log(`  ! ${o}`);
+  }
+
+  const skillSkips = skillMutating.filter(
+    (s): s is Extract<SkillPlanAction, { kind: "skill.skip-create" }> =>
+      s.kind === "skill.skip-create",
+  );
+  if (skillSkips.length > 0) {
+    console.log(
+      `\nWarning: ${skillSkips.length} local skill yaml(s) have no remote match. ` +
+        "Skills cannot be created via this CLI — use `goclaw skills upload <dir>` instead:",
+    );
+    for (const s of skillSkips) console.log(`  ! ${s.tenantSlug}/${s.slug}`);
+  }
+}
+
+function printMcpAction(a: McpPlanAction): void {
+  switch (a.kind) {
+    case "mcp.create":
+      console.log(
+        `      + create   ${a.slug}  transport=${formatValue(a.body.transport)} ` +
+          `url=${formatValue(a.body.url)} command=${formatValue(a.body.command)}`,
+      );
+      break;
+    case "mcp.update":
+      console.log(`      ~ update   ${a.slug}`);
+      for (const d of a.diffs) console.log(`                  ${d}`);
+      break;
+    case "mcp.delete":
+      console.log(`      - delete   ${a.slug}  (id=${a.remoteId})`);
+      break;
+    case "mcp.unchanged":
+      break;
+  }
+}
+
+function printSkillAction(a: SkillPlanAction): void {
+  switch (a.kind) {
+    case "skill.update":
+      console.log(`      ~ update   ${a.slug}`);
+      for (const d of a.diffs) console.log(`                  ${d}`);
+      break;
+    case "skill.delete":
+      console.log(`      - delete   ${a.slug}  (id=${a.remoteId})`);
+      break;
+    case "skill.skip-create":
+      console.log(`      ! skip     ${a.slug}  (create requires \`goclaw skills upload\`)`);
+      break;
+    case "skill.unchanged":
+      break;
   }
 }
 
@@ -984,6 +1550,8 @@ async function applyPlan(
   tenantPlan: TenantPlanAction[],
   agentPlan: AgentPlanAction[],
   providerPlan: ProviderPlanAction[],
+  mcpPlan: McpPlanAction[],
+  skillPlan: SkillPlanAction[],
   remoteTenants: Tenant[],
 ): Promise<void> {
   console.log("\nApplying...");
@@ -1055,6 +1623,70 @@ async function applyPlan(
         break;
       case "provider.unchanged":
         break;
+    }
+  }
+
+  if (mcpPlan.some((p) => p.kind !== "mcp.unchanged")) {
+    console.log("  MCP servers:");
+    for (const a of mcpPlan) {
+      const tenantId = tenantIdBySlug.get(a.tenantSlug);
+      if (!tenantId) {
+        throw new Error(
+          `Cannot apply mcp action for tenant slug "${a.tenantSlug}" — tenant id not resolved.`,
+        );
+      }
+      switch (a.kind) {
+        case "mcp.create": {
+          const created = await client.createMcpServer(tenantId, a.body);
+          console.log(`    + created  ${a.tenantSlug}/${a.slug} (id=${created.id})`);
+          await sealMcpHeaders(a.yamlPath, a.body);
+          break;
+        }
+        case "mcp.update":
+          if (Object.keys(a.updates).length > 0) {
+            await client.updateMcpServer(a.remoteId, tenantId, a.updates);
+            console.log(
+              `    ~ updated  ${a.tenantSlug}/${a.slug} (${Object.keys(a.updates).length} field(s))`,
+            );
+            await sealMcpHeaders(a.yamlPath, a.updates);
+          }
+          break;
+        case "mcp.delete":
+          await client.deleteMcpServer(a.remoteId, tenantId);
+          console.log(`    - deleted  ${a.tenantSlug}/${a.slug}`);
+          break;
+        case "mcp.unchanged":
+          break;
+      }
+    }
+  }
+
+  if (skillPlan.some((p) => p.kind !== "skill.unchanged" && p.kind !== "skill.skip-create")) {
+    console.log("  Skills:");
+    for (const a of skillPlan) {
+      const tenantId = tenantIdBySlug.get(a.tenantSlug);
+      if (!tenantId) {
+        throw new Error(
+          `Cannot apply skill action for tenant slug "${a.tenantSlug}" — tenant id not resolved.`,
+        );
+      }
+      switch (a.kind) {
+        case "skill.update":
+          if (Object.keys(a.updates).length > 0) {
+            await client.updateSkill(a.remoteId, tenantId, a.updates);
+            console.log(
+              `    ~ updated  ${a.tenantSlug}/${a.slug} (${Object.keys(a.updates).length} field(s))`,
+            );
+          }
+          break;
+        case "skill.delete":
+          await client.deleteSkill(a.remoteId, tenantId);
+          console.log(`    - deleted  ${a.tenantSlug}/${a.slug}`);
+          break;
+        case "skill.skip-create":
+        case "skill.unchanged":
+          break;
+      }
     }
   }
 

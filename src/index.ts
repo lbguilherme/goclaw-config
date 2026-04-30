@@ -5,25 +5,34 @@ import { push } from "./commands/push.ts";
 type CommandHandler = (args: string[]) => Promise<void>;
 
 const COMMANDS: Record<string, CommandHandler> = {
-  pull: async () => {
-    await pull();
+  pull: async (args) => {
+    const tenantSlug = positional(args);
+    await pull({ tenantSlug });
   },
   push: async (args) => {
     const yes = args.includes("-y") || args.includes("--yes");
-    await push({ yes });
+    const tenantSlug = positional(args);
+    await push({ yes, tenantSlug });
   },
 };
+
+function positional(args: string[]): string | undefined {
+  return args.find((a) => !a.startsWith("-"));
+}
 
 function printUsage(): void {
   console.log(`goclaw-config — pull and push GoClaw configuration via REST API
 
 Usage:
-  goclaw-config <command> [flags]
+  goclaw-config <command> [<tenant-slug>] [flags]
 
 Commands:
-  pull           Download tenants, agents, and agent context files into the output directory
-  push [-y]      Sync local tenants to GoClaw (create / update / archive)
-  help           Show this message
+  pull [<tenant-slug>]       Download tenants, providers, MCP servers, skills, and agents (with context files)
+  push [<tenant-slug>] [-y]  Sync local tenants/providers/mcps/skills/agents to GoClaw (create / update / archive)
+  help                       Show this message
+
+When <tenant-slug> is provided, the command is scoped to that single tenant
+(no other tenant is read, written, or archived).
 
 Flags:
   -y, --yes      Apply the plan without asking for confirmation (push only)

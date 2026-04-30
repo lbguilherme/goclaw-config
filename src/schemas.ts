@@ -621,10 +621,139 @@ export const ProviderSchema = z
 
 export type ProviderConfig = z.infer<typeof ProviderSchema>;
 
+// ─────────────────────────── MCP server ───────────────────────────
+
+/**
+ * Sentinel written in place of header values that look like secrets (api keys,
+ * tokens, passwords). Push detects this exact value and strips the header from
+ * the update payload so the server-side value is preserved. Replace with the
+ * real value to rotate.
+ */
+export const MCP_HEADER_SECRET_SENTINEL = "[encrypted]";
+
+const MCP_TRANSPORTS = ["stdio", "sse", "streamable-http"] as const;
+
+export const MCP_SERVER_DEFAULTS = {
+  transport: "stdio",
+  args: [] as string[],
+  timeout_sec: 60,
+  headers: {} as Record<string, string>,
+  env: {} as Record<string, string>,
+  settings: {} as Record<string, unknown>,
+  enabled: true,
+} as const;
+
+const SENSITIVE_HEADER_PATTERN =
+  /^(authorization|cookie|x-?.*-?(api[-_]?key|secret|token|password|auth)|.*[-_](key|secret|token|password|auth))$/i;
+
+/** True for header names that look like they carry credentials. */
+export function isSensitiveHeaderKey(name: string): boolean {
+  return SENSITIVE_HEADER_PATTERN.test(name);
+}
+
+export const McpServerSchema = z
+  .strictObject({
+    display_name: z.string().optional().describe("Human-readable label shown in UI."),
+    transport: z
+      .enum(MCP_TRANSPORTS)
+      .default(MCP_SERVER_DEFAULTS.transport)
+      .describe("Wire transport. `stdio` requires `command`+`args`; `sse`/`streamable-http` require `url`."),
+    command: z
+      .string()
+      .optional()
+      .describe("Launch command for stdio transport (e.g. `npx`)."),
+    args: z
+      .array(z.string())
+      .default([...MCP_SERVER_DEFAULTS.args])
+      .describe("Command arguments for stdio transport."),
+    url: z.string().optional().describe("Endpoint URL for sse/streamable-http transports."),
+    prefix: z.string().optional().describe("Optional tool-name prefix injected before each tool name."),
+    timeout_sec: z
+      .number()
+      .int()
+      .nonnegative()
+      .default(MCP_SERVER_DEFAULTS.timeout_sec)
+      .describe("Per-call timeout in seconds."),
+    headers: z
+      .record(z.string(), z.string())
+      .default({ ...MCP_SERVER_DEFAULTS.headers })
+      .describe(
+        "HTTP headers sent on every request to this MCP. Header values matching credential-like " +
+          `names are masked on pull as "${MCP_HEADER_SECRET_SENTINEL}"; replace the sentinel with ` +
+          "the real value to rotate. Sentinels are dropped from update payloads.",
+      ),
+    env: z
+      .record(z.string(), z.string())
+      .default({ ...MCP_SERVER_DEFAULTS.env })
+      .describe("Environment variables for stdio transport (server-side only)."),
+    settings: z
+      .record(z.string(), z.unknown())
+      .default({ ...MCP_SERVER_DEFAULTS.settings })
+      .describe("Free-form JSON bag for server-specific settings."),
+    enabled: z
+      .boolean()
+      .default(MCP_SERVER_DEFAULTS.enabled)
+      .describe("When false, agents cannot use this MCP."),
+  })
+  .describe(
+    "Configuration file written to <tenant>/mcps/<name>.yaml. Filename is the MCP server name " +
+      "(= `name` field server-side, used by grants to reference this MCP).",
+  );
+
+export type McpServerConfig = z.infer<typeof McpServerSchema>;
+
+// ─────────────────────────── Skill ───────────────────────────
+
+export const SKILL_DEFAULTS = {
+  visibility: "private",
+  enabled: true,
+} as const;
+
+const SKILL_VISIBILITIES = ["private", "shared", "public"] as const;
+
+/**
+ * Fields that push sends in the PUT /v1/skills/{id} body. Read-only fields
+ * (status, source, is_system, version, slug) are present in the yaml for
+ * visibility but never round-trip to the server.
+ */
+export const SKILL_WRITE_FIELDS = ["name", "description", "visibility", "enabled"] as const;
+
+export const SkillSchema = z
+  .strictObject({
+    name: z.string().min(1).describe("Skill display name."),
+    slug: z.string().optional().describe("Skill slug (defaults to filename)."),
+    description: z.string().optional().describe("Triggers / when-to-use prose for the skill."),
+    visibility: z
+      .enum(SKILL_VISIBILITIES)
+      .default(SKILL_DEFAULTS.visibility)
+      .describe("Visibility scope: private (this tenant), shared (other tenants), public (catalog)."),
+    enabled: z
+      .boolean()
+      .default(SKILL_DEFAULTS.enabled)
+      .describe("When false, agents cannot invoke this skill."),
+    version: z.number().int().nonnegative().optional().describe("Skill version (read-only)."),
+    status: z.string().optional().describe("Lifecycle status returned by the server (read-only)."),
+    source: z.string().optional().describe("Skill source (`managed`, etc.) — read-only."),
+    is_system: z
+      .boolean()
+      .optional()
+      .describe(
+        "True for system-managed skills. Pull skips these; never set this manually.",
+      ),
+  })
+  .describe(
+    "Configuration file written to <tenant>/skills/<slug>.yaml. Only metadata is synced — " +
+      "skill content (SKILL.md and assets) is uploaded out-of-band via `goclaw skills upload`.",
+  );
+
+export type SkillConfig = z.infer<typeof SkillSchema>;
+
 export const SCHEMA_REGISTRY = {
   tenant: { schema: TenantSchema, fileName: "tenant.schema.json" },
   agent: { schema: AgentSchema, fileName: "agent.schema.json" },
   provider: { schema: ProviderSchema, fileName: "provider.schema.json" },
+  mcp: { schema: McpServerSchema, fileName: "mcp.schema.json" },
+  skill: { schema: SkillSchema, fileName: "skill.schema.json" },
 } as const;
 
 export type SchemaName = keyof typeof SCHEMA_REGISTRY;

@@ -22,6 +22,37 @@ export interface Provider {
   [key: string]: unknown;
 }
 
+export interface McpServer {
+  id: string;
+  name?: string;
+  display_name?: string;
+  transport?: string;
+  url?: string;
+  command?: string;
+  args?: string[];
+  prefix?: string;
+  timeout_sec?: number;
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+  settings?: Record<string, unknown>;
+  enabled?: boolean;
+  [key: string]: unknown;
+}
+
+export interface Skill {
+  id: string;
+  name?: string;
+  slug?: string;
+  description?: string;
+  visibility?: string;
+  version?: number;
+  enabled?: boolean;
+  status?: string;
+  source?: string;
+  is_system?: boolean;
+  [key: string]: unknown;
+}
+
 export class GoClawClient {
   constructor(private readonly config: Config) {}
 
@@ -161,6 +192,70 @@ export class GoClawClient {
     });
   }
 
+  async listMcpServers(tenantId: string): Promise<McpServer[]> {
+    const data = await this.json<McpServer[] | { servers?: McpServer[]; data?: McpServer[] }>(
+      "/v1/mcp/servers",
+      { tenantId },
+    );
+    return normalizeList<McpServer>(data, ["servers", "data"]);
+  }
+
+  async createMcpServer(tenantId: string, body: Record<string, unknown>): Promise<McpServer> {
+    return await this.json<McpServer>("/v1/mcp/servers", {
+      method: "POST",
+      tenantId,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async updateMcpServer(
+    serverId: string,
+    tenantId: string,
+    updates: Record<string, unknown>,
+  ): Promise<void> {
+    await this.request(`/v1/mcp/servers/${encodeURIComponent(serverId)}`, {
+      method: "PUT",
+      tenantId,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    });
+  }
+
+  async deleteMcpServer(serverId: string, tenantId: string): Promise<void> {
+    await this.request(`/v1/mcp/servers/${encodeURIComponent(serverId)}`, {
+      method: "DELETE",
+      tenantId,
+    });
+  }
+
+  async listSkills(tenantId: string): Promise<Skill[]> {
+    const data = await this.json<Skill[] | { skills?: Skill[]; data?: Skill[] }>(
+      "/v1/skills",
+      { tenantId },
+    );
+    return normalizeList<Skill>(data, ["skills", "data"]);
+  }
+
+  async updateSkill(
+    skillId: string,
+    tenantId: string,
+    updates: Record<string, unknown>,
+  ): Promise<void> {
+    await this.request(`/v1/skills/${encodeURIComponent(skillId)}`, {
+      method: "PUT",
+      tenantId,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    });
+  }
+
+  async deleteSkill(skillId: string, tenantId: string): Promise<void> {
+    await this.request(`/v1/skills/${encodeURIComponent(skillId)}`, {
+      method: "DELETE",
+      tenantId,
+    });
+  }
 }
 
 function normalizeList<T>(data: unknown, keys: string[]): T[] {
